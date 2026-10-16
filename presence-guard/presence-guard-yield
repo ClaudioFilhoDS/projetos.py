@@ -1,14 +1,18 @@
 #!/bin/sh
 # Chamado pelo PAM (pam_exec) logo antes do Howdy: pede para o presence-guard
 # soltar a câmera IR e espera (no máximo 2 s) ele soltar, senão o Howdy não
-# consegue abrir a câmera.
+# consegue abrir a câmera. Nunca falha: o PAM segue normalmente de qualquer jeito.
 /usr/bin/touch /run/presence-guard.yield 2>/dev/null
 
 camera_busy() {
     for flag in /run/user/*/presence-guard/camera-open; do
         [ -f "$flag" ] || continue
-        pid=$(/usr/bin/cat "$flag" 2>/dev/null)
-        [ -n "$pid" ] && [ -d "/proc/$pid" ] && return 0
+        # o arquivo é do usuário: lê só o começo e só aceita um número (PID)
+        pid=$(/usr/bin/head -c 12 "$flag" 2>/dev/null)
+        case "$pid" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        [ -d "/proc/$pid" ] && return 0
     done
     return 1
 }

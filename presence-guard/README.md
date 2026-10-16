@@ -135,7 +135,10 @@ Clique na tela borrada para ignorar por 20 s (não funciona quando é outra pess
 ## Energia
 
 - Ligado: a câmera IR fica ligada; o programa acorda 1,5x por segundo para analisar
-  (4x quando algo muda). Na bateria, metade.
+  (4x quando algo muda). Na bateria, metade. Fora isso ele dorme: o Howdy, a calibração e a
+  tela de bloqueio acordam ele na hora por eventos (nada de ficar conferindo toda hora).
+- Medido numa máquina de teste mais lenta que o Core Ultra 5: ~3,5% de um núcleo vigiando,
+  ~0% com a tela bloqueada. Memória: ~170 MB, ou ~260 MB com o reconhecimento de rosto.
 - Com a tela bloqueada a câmera é desligada (a não ser que `desbloqueio_ao_chegar = sim`).
 - Com a tampa da câmera fechada ele pausa sozinho (imagem escura não conta como "saiu").
 - O reconhecimento (SFace) só é carregado se você cadastrar o rosto, e roda a cada 5 s.

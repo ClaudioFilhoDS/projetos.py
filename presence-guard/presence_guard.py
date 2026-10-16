@@ -23,15 +23,18 @@ Comandos:
 
 import argparse
 import configparser
+import ctypes
+import ctypes.util
 import glob
 import io
 import json
 import logging
 import math
 import os
-import queue
 import re
+import select
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -102,6 +105,9 @@ LOCKED_RATE = 1.0          # análises por segundo com a tela bloqueada
 LEARN_WINDOW = 15.0        # segundos depois de desbloquear em que ele pode aprender seu rosto
 MAX_AUTO_SAMPLES = 30
 LABELS = {"sem_oculos": "sem óculos", "com_oculos": "com óculos"}
+PAUSE_HOLD = "cadastro/calibração/preview usando a câmera"
+PAUSE_HOWDY = "Howdy usando a câmera"
+PAUSE_LOCKED = "tela bloqueada"
 
 log = logging.getLogger(APP)
 
@@ -726,14 +732,93 @@ class Attention:
         return True, ""
 
 
+class Waker:
+    """Faz a thread da câmera dormir até a próxima análise, mas acordar na hora se
+    algo importante acontecer: Howdy pedindo a câmera (inotify em /run), cadastro ou
+    calibração começando (inotify na pasta de runtime), tela bloqueando (wake())."""
+
+    IN_ATTRIB, IN_CLOSE_WRITE, IN_MOVED_TO, IN_CREATE, IN_DELETE = 0x4, 0x8, 0x80, 0x100, 0x200
+
+    def __init__(self):
+        self.read_fd, self.write_fd = os.pipe()
+        for fd in (self.read_fd, self.write_fd):
+            os.set_blocking(fd, False)
+        self.names = {YIELD_FILE.name, HOLD_FILE.name}
+        self.inotify = -1
+        try:
+            libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+            fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+            if fd >= 0:
+                RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+                mask = (self.IN_ATTRIB | self.IN_CLOSE_WRITE | self.IN_MOVED_TO
+                        | self.IN_CREATE | self.IN_DELETE)
+                dirs = {str(YIELD_FILE.parent), str(RUNTIME_DIR)}
+                if all(libc.inotify_add_watch(fd, d.encode(), mask) >= 0 for d in dirs):
+                    self.inotify = fd
+                else:
+                    os.close(fd)
+        except (OSError, AttributeError):
+            pass
+        if self.inotify < 0:
+            log.info("inotify indisponível: conferindo os arquivos 2x por segundo")
+
+    def wake(self):
+        """Pode ser chamado de qualquer thread."""
+        try:
+            os.write(self.write_fd, b"!")
+        except BlockingIOError:
+            pass
+
+    def wait(self, timeout):
+        """Dorme até `timeout` segundos ou até algo importante acontecer."""
+        if self.inotify < 0:
+            timeout = min(timeout, 0.5)
+        deadline = time.monotonic() + max(0.0, timeout)
+        fds = [self.read_fd] + ([self.inotify] if self.inotify >= 0 else [])
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            ready, _, _ = select.select(fds, [], [], left)
+            if not ready:
+                return
+            if self.read_fd in ready:
+                try:
+                    os.read(self.read_fd, 4096)
+                except BlockingIOError:
+                    pass
+                return
+            if self._relevant():
+                return
+
+    def _relevant(self):
+        try:
+            buf = os.read(self.inotify, 65536)
+        except BlockingIOError:
+            return False
+        i, found = 0, False
+        while i + 16 <= len(buf):
+            _wd, _mask, _cookie, size = struct.unpack_from("iIII", buf, i)
+            name = buf[i + 16:i + 16 + size].split(b"\0", 1)[0].decode(errors="replace")
+            found = found or name in self.names
+            i += 16 + size
+        return found
+
+
 class LockWatcher:
     """Acompanha a tela de bloqueio do GNOME pelos sinais do D-Bus, sem ficar perguntando."""
 
-    def __init__(self):
+    def __init__(self, on_change=lambda: None):
+        self.on_change = on_change
         self.locked = screen_locked()
         self.proc = None
         self.stop = threading.Event()
         threading.Thread(target=self._run, name="lock-watch", daemon=True).start()
+
+    def _set(self, locked):
+        if locked != self.locked:
+            self.locked = locked
+            self.on_change()
 
     def _run(self):
         while not self.stop.is_set():
@@ -744,17 +829,17 @@ class LockWatcher:
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
             except OSError:
                 while not self.stop.wait(2):  # sem gdbus: pergunta a cada 2 s
-                    self.locked = screen_locked()
+                    self._set(screen_locked())
                 return
             self.resync()
             for line in self.proc.stdout:
                 if "ActiveChanged" in line:
-                    self.locked = "true" in line
+                    self._set("true" in line)
             self.proc.wait()
             self.stop.wait(2)
 
     def resync(self):
-        self.locked = screen_locked()
+        self._set(screen_locked())
 
     def close(self):
         self.stop.set()
@@ -776,6 +861,7 @@ class Guard:
         self.tracker = Tracker()
         self.attention = Attention(cfg)
         self.watcher = None
+        self.waker = Waker()
         self.file_mtimes = self.config_mtimes()
         self.stop = threading.Event()
         self.crashed = False
@@ -822,6 +908,15 @@ class Guard:
         self.other_since = None
         self.stranger_since = None
 
+    def sleep(self, seconds):
+        """Dorme até `seconds`, acordando antes se o Howdy pedir a câmera, a tela bloquear etc."""
+        if not self.stop.is_set():
+            self.waker.wait(seconds)
+
+    def shutdown(self):
+        self.stop.set()
+        self.waker.wake()
+
     def snooze(self, seconds=20):
         """Clique na tela borrada. Não vale quando quem está na frente é outra pessoa."""
         if self.blur_reason == "estranho":
@@ -852,12 +947,20 @@ class Guard:
 
     def pause_reason(self, now):
         if pid_file_alive(HOLD_FILE):
-            return "cadastro/calibração/preview usando a câmera"
+            return PAUSE_HOLD
         if now < self.yield_until:
-            return "Howdy usando a câmera"
+            return PAUSE_HOWDY
         if self.locked and not self.cfg.wake_on_approach:
-            return "tela bloqueada"
+            return PAUSE_LOCKED
         return None
+
+    def pause_timeout(self, reason, now):
+        """Quanto dormir pausado: os eventos acordam antes, isto é só a rede de segurança."""
+        if reason == PAUSE_HOWDY:
+            return max(0.1, self.yield_until - now)
+        if reason == PAUSE_LOCKED:
+            return 30.0
+        return 2.0  # cadastro/calibração: confere se o processo ainda existe
 
     def housekeeping(self, now):
         locked = self.watcher.locked
@@ -906,7 +1009,7 @@ class Guard:
 
     def run(self):
         try:
-            self.watcher = LockWatcher()
+            self.watcher = LockWatcher(on_change=self.waker.wake)
             self._loop()
         except Exception:
             log.exception("erro inesperado")
@@ -915,6 +1018,8 @@ class Guard:
             self.cam.close()
             if self.watcher:
                 self.watcher.close()
+            if self.ui:
+                self.ui.quit()
 
     def _loop(self):
         CAMERA_FLAG.unlink(missing_ok=True)
@@ -937,10 +1042,10 @@ class Guard:
                 self.set_blur(None)
                 self.reset_presence(now)
                 self.tracker.clear()
-                self.stop.wait(0.25)
+                self.sleep(self.pause_timeout(reason, now))
                 continue
             if now < next_analysis:
-                self.stop.wait(min(0.25, next_analysis - now))
+                self.sleep(next_analysis - now)
                 continue
             if not self.cam.is_open:
                 try:
@@ -949,13 +1054,13 @@ class Guard:
                     if now - camera_error_logged > 60:
                         log.warning("%s", e)
                         camera_error_logged = now
-                    self.stop.wait(2)
+                    self.sleep(2)
                     continue
             frame = self.cam.fresh_frame()
             if frame is None:
                 log.warning("a câmera parou de responder; reabrindo")
                 self.cam.close()
-                self.stop.wait(1)
+                self.sleep(1)
                 continue
             now = time.monotonic()
             if self.locked:
@@ -1160,7 +1265,7 @@ class Guard:
             log.info("você chegou com a tela bloqueada: chamando o Howdy")
             self.cam.close()
             self.yield_until = now + 6
-            self.stop.wait(0.3)
+            self.sleep(0.3)
             # Ctrl abre a caixa de senha do GNOME sem digitar nada nela.
             sh("xdotool", "key", "Control_L")
 
@@ -1168,32 +1273,54 @@ class Guard:
 # --------------------------------------------------------------------------- tela borrada
 
 class Overlay:
-    """Janela por cima de tudo com uma "foto" borrada da tela (X11), sem texto."""
+    """Janela por cima de tudo com uma "foto" borrada da tela (X11), sem texto.
+
+    A thread da câmera fala com o Tk por um pipe: o Tk só acorda quando chega um
+    pedido (ou um sinal, via set_wakeup_fd), em vez de ficar conferindo toda hora."""
 
     def __init__(self, root, on_click):
+        import tkinter as tk
+
         self.root = root
         self.on_click = on_click
-        self.requests = queue.Queue()
         self.win = None
         self.photo = None
-        root.after(50, self._poll)
+        self.read_fd, self.write_fd = os.pipe()
+        for fd in (self.read_fd, self.write_fd):
+            os.set_blocking(fd, False)
+        root.tk.createfilehandler(self.read_fd, tk.READABLE, self._on_pipe)
 
     def request(self, show):
         """Chamado pela thread da câmera."""
-        self.requests.put(bool(show))
+        self._send(b"1" if show else b"0")
 
-    def _poll(self):
-        show = None
-        while True:
-            try:
-                show = self.requests.get_nowait()
-            except queue.Empty:
-                break
-        if show is True and self.win is None:
+    def quit(self):
+        """A thread da câmera terminou: encerra o Tk também."""
+        self._send(b"q")
+
+    def _send(self, byte):
+        try:
+            os.write(self.write_fd, byte)
+        except BlockingIOError:
+            pass
+
+    def _on_pipe(self, fd, _mask):
+        try:
+            data = os.read(fd, 4096)
+        except BlockingIOError:
+            return
+        # bytes de sinal também caem aqui; o Python trata o sinal logo depois deste callback
+        if b"q" in data:
+            self.root.quit()
+            return
+        last = max(data.rfind(b"0"), data.rfind(b"1"))
+        if last < 0:
+            return
+        show = data[last:last + 1] == b"1"
+        if show and self.win is None:
             self._show()
-        elif show is False and self.win is not None:
+        elif not show and self.win is not None:
             self._hide()
-        self.root.after(50, self._poll)
 
     def _show(self):
         import tkinter as tk
@@ -1258,25 +1385,21 @@ def cmd_run(args):
         log.info("rosto não cadastrado: rode 'presence-guard cadastrar' para ele reconhecer você")
     root = tk.Tk()
     root.withdraw()
-    guard.ui = Overlay(root, on_click=guard.snooze)
+    overlay = Overlay(root, on_click=guard.snooze)
+    guard.ui = overlay
     worker = threading.Thread(target=guard.run, name="camera", daemon=True)
-    worker.start()
 
     def shutdown(*_):
-        guard.stop.set()
+        guard.shutdown()
         root.quit()
-
-    def watchdog():
-        if not worker.is_alive():
-            root.quit()
-        else:
-            root.after(1000, watchdog)
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
-    root.after(1000, watchdog)
+    # o Tk dorme sem timers; um sinal escreve no pipe dele e o acorda para tratar
+    signal.set_wakeup_fd(overlay.write_fd, warn_on_full_buffer=False)
+    worker.start()
     root.mainloop()
-    guard.stop.set()
+    guard.shutdown()
     worker.join(timeout=5)
     guard.engine.close()
     return 1 if guard.crashed else 0
