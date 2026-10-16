@@ -105,6 +105,17 @@ LOCKED_RATE = 1.0          # análises por segundo com a tela bloqueada
 LEARN_WINDOW = 15.0        # segundos depois de desbloquear em que ele pode aprender seu rosto
 MAX_AUTO_SAMPLES = 30
 LABELS = {"sem_oculos": "sem óculos", "com_oculos": "com óculos"}
+# Níveis do borrão: (quanto a imagem é reduzida antes de ampliar de volta, brilho)
+BLUR_LEVELS = {
+    1: (13, 0.90),   # leve: dá para ver as janelas, não dá para ler
+    2: (18, 0.80),   # médio
+    3: (32, 0.62),   # forte
+    4: (32, 0.45),   # forte, escurecendo...
+    5: (32, 0.30),   # ...até bloquear
+}
+LEVEL_NAMES = {"leve": 1, "medio": 2, "médio": 2, "forte": 3}
+TURNED_MAX = 15.0          # por até 15 s, rosto sumido com a cabeça ainda ali = "virou o rosto"
+HEAD_STILL_RATIO = 0.6     # a região do rosto continua com pelo menos 60% do brilho de antes
 PAUSE_HOLD = "cadastro/calibração/preview usando a câmera"
 PAUSE_HOWDY = "Howdy usando a câmera"
 PAUSE_LOCKED = "tela bloqueada"
@@ -140,6 +151,15 @@ DEFAULTS = {
         "analises_por_segundo": "1.5",
         "analises_por_segundo_alerta": "4",
         "economia_na_bateria": "sim",
+    },
+    "borrao": {
+        "virou_o_rosto": "leve",
+        "outra_pessoa_olhando": "medio",
+        "escurecer_ate_bloquear": "sim",
+    },
+    "atividade": {
+        "considerar_teclado_e_mouse": "sim",
+        "segundos_de_atividade": "3",
     },
     "recursos": {
         "bloquear": "sim",
@@ -182,6 +202,15 @@ class Config:
         self.pause_blur_in_videos = flag("recursos", "pausar_borrao_em_videos")
         self.wake_on_approach = flag("recursos", "desbloqueio_ao_chegar")
         self.notifications = flag("recursos", "notificacoes")
+
+        def level(key, default):
+            return LEVEL_NAMES.get(cp.get("borrao", key).strip().lower(), default)
+
+        self.level_look = level("virou_o_rosto", 1)
+        self.level_other = level("outra_pessoa_olhando", 2)
+        self.darken = flag("borrao", "escurecer_ate_bloquear")
+        self.use_input = flag("atividade", "considerar_teclado_e_mouse")
+        self.input_seconds = num("atividade", "segundos_de_atividade")
 
 
 # --------------------------------------------------------------------------- sistema
@@ -732,6 +761,59 @@ class Attention:
         return True, ""
 
 
+def x_init_threads():
+    """Liga o modo multi-thread do Xlib (o Tk usa uma conexão, a thread da câmera outra)."""
+    try:
+        ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6").XInitThreads()
+    except (OSError, AttributeError):
+        pass
+
+
+class _XssInfo(ctypes.Structure):
+    _fields_ = [("window", ctypes.c_ulong), ("state", ctypes.c_int), ("kind", ctypes.c_int),
+                ("til_or_since", ctypes.c_ulong), ("idle", ctypes.c_ulong),
+                ("event_mask", ctypes.c_ulong)]
+
+
+class InputIdle:
+    """Há quantos segundos você não mexe no teclado/mouse (X11, extensão XScreenSaver)."""
+
+    def __init__(self):
+        self.ok = False
+        try:
+            x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+            xss = ctypes.CDLL(ctypes.util.find_library("Xss") or "libXss.so.1")
+        except OSError:
+            log.info("libXss indisponível: teclado/mouse não serão considerados")
+            return
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        xss.XScreenSaverAllocInfo.restype = ctypes.POINTER(_XssInfo)
+        xss.XScreenSaverQueryInfo.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                              ctypes.POINTER(_XssInfo)]
+        self.display = x11.XOpenDisplay(None)
+        if not self.display:
+            return
+        self.root = x11.XDefaultRootWindow(self.display)
+        self.info = xss.XScreenSaverAllocInfo()
+        self.xss = xss
+        self.ok = bool(self.info)
+
+    def seconds(self):
+        if not self.ok or not self.xss.XScreenSaverQueryInfo(self.display, self.root, self.info):
+            return None
+        return self.info.contents.idle / 1000.0
+
+
+def region_luma(frame, box):
+    """Brilho médio da imagem dentro de `box` (x, y, w, h)."""
+    x, y, w, h = (int(round(v)) for v in box)
+    patch = frame[max(0, y):max(0, y + h), max(0, x):max(0, x + w)]
+    return float(patch.mean()) if patch.size else 0.0
+
+
 class Waker:
     """Faz a thread da câmera dormir até a próxima análise, mas acordar na hora se
     algo importante acontecer: Howdy pedindo a câmera (inotify em /run), cadastro ou
@@ -871,6 +953,10 @@ class Guard:
         self.blind = False
         self.alert = False
         self.blur_reason = None
+        self.blur_level = 0
+        self.input = None
+        self.face_box = None
+        self.face_luma = None
         self.snooze_until = 0.0
         self.grace_until = now + cfg.grace
         self.lock_requested = -1e9
@@ -924,11 +1010,20 @@ class Guard:
         self.snooze_until = time.monotonic() + seconds
         return True
 
-    def set_blur(self, reason):
-        changed = (reason is None) != (self.blur_reason is None)
+    def set_blur(self, reason, level=3):
+        level = level if reason else 0
         self.blur_reason = reason
-        if changed and self.ui:
-            self.ui.request(reason is not None)
+        if level != self.blur_level:
+            self.blur_level = level
+            if self.ui:
+                self.ui.request(level)
+
+    def darkening(self, elapsed, limit):
+        """Borrão forte que vai escurecendo até a hora de bloquear (contagem sem números)."""
+        if not self.cfg.darken:
+            return 3
+        span = max(1.0, limit - self.cfg.blur_after)
+        return 3 + min(2, max(0, int(3 * (elapsed - self.cfg.blur_after) / span)))
 
     def rate(self):
         if self.locked:
@@ -1010,6 +1105,8 @@ class Guard:
     def run(self):
         try:
             self.watcher = LockWatcher(on_change=self.waker.wake)
+            if self.cfg.use_input:
+                self.input = InputIdle()
             self._loop()
         except Exception:
             log.exception("erro inesperado")
@@ -1136,10 +1233,18 @@ class Guard:
             self.identify(frame, rows, tracks, now)
         subject = next((i for i, t in enumerate(tracks) if t.status != "estranho"), None)
         strangers = sum(t.status == "estranho" for t in tracks)
+        alone_stranger = subject is None and strangers > 0
+        idle = self.input.seconds() if self.input else None
+        typing = idle is not None and idle < cfg.input_seconds  # mexendo no teclado/mouse
 
         looking, why = False, "sem rosto"
+        head_turned = False
         if subject is not None:
             self.last_present = now
+            box = tuple(float(v) for v in rows[subject][:4])
+            luma = region_luma(frame, box)
+            self.face_box = box
+            self.face_luma = luma if self.face_luma is None else 0.8 * self.face_luma + 0.2 * luma
             pose = self.engine.pose(frame, rows[subject])
             if pose is None:
                 looking, why = True, ""  # achou o rosto mas não conseguiu medir: não pune
@@ -1165,8 +1270,21 @@ class Guard:
                               len(rows), feats["yaw"], feats["pitch"], pose.gaze_h, pose.gaze_v,
                               "" if use_eyes else " [olhos ignorados]",
                               "olhando" if looking else f"não olhando ({why})")
-        else:
-            log.debug("sem você na frente (%d rosto(s) estranho(s))", strangers)
+        elif not alone_stranger and self.face_box is not None and self.face_luma:
+            # No infravermelho a cabeça perto da câmera fica clara e o fundo escuro: se onde
+            # estava o rosto continua claro, você só virou o rosto (de perfil ele some).
+            head_turned = (now - self.last_present < TURNED_MAX and self.face_luma >= 25
+                           and region_luma(frame, self.face_box) >= HEAD_STILL_RATIO * self.face_luma)
+        if typing and not alone_stranger:
+            # digitando/mexendo no mouse: você está aí, mesmo olhando o teclado ou fora da câmera
+            if subject is None:
+                self.last_present = now
+            if not looking:
+                log.debug("teclado/mouse em uso: conta como olhando")
+            looking = True
+        if subject is None and not typing:
+            log.debug("sem você na frente (%d rosto(s) estranho(s))%s", strangers,
+                      " — cabeça virada" if head_turned else "")
         self.looking_streak = self.looking_streak + 1 if looking else 0
         if looking:
             self.last_looking = now
@@ -1187,7 +1305,6 @@ class Guard:
         other_alert = self.other_since is not None and now - self.other_since >= 1.0
 
         # outra pessoa no seu lugar, sem você
-        alone_stranger = subject is None and strangers > 0
         if not alone_stranger:
             self.stranger_since = None
         elif self.stranger_since is None:
@@ -1231,8 +1348,17 @@ class Guard:
                 reason = "outra pessoa"
         if reason in ("olhar", "outra pessoa") and cfg.pause_blur_in_videos and self.video_playing(now):
             reason = None
+        level = 0
+        if reason == "estranho":
+            level = self.darkening(absent_for, limit)
+        elif reason == "olhar":
+            # só virou o rosto: leve; saiu: forte, escurecendo até bloquear
+            present = subject is not None or head_turned
+            level = cfg.level_look if present else self.darkening(absent_for, cfg.lock_after)
+        elif reason == "outra pessoa":
+            level = cfg.level_other
         self.alert = self.alert or reason is not None
-        self.set_blur(reason)
+        self.set_blur(reason, level)
 
     def process_locked(self, frame, now):
         """Tela bloqueada + desbloqueio_ao_chegar: quando você volta, chama o Howdy."""
@@ -1283,16 +1409,16 @@ class Overlay:
 
         self.root = root
         self.on_click = on_click
-        self.win = None
-        self.photo = None
+        self.win = self.canvas = self.photo = self.shot = None
+        self.bases, self.level, self.image_item = {}, 0, None
         self.read_fd, self.write_fd = os.pipe()
         for fd in (self.read_fd, self.write_fd):
             os.set_blocking(fd, False)
         root.tk.createfilehandler(self.read_fd, tk.READABLE, self._on_pipe)
 
-    def request(self, show):
-        """Chamado pela thread da câmera."""
-        self._send(b"1" if show else b"0")
+    def request(self, level):
+        """Chamado pela thread da câmera: 0 tira o borrão, 1..5 = nível (BLUR_LEVELS)."""
+        self._send(str(int(level)).encode())
 
     def quit(self):
         """A thread da câmera terminou: encerra o Tk também."""
@@ -1313,41 +1439,59 @@ class Overlay:
         if b"q" in data:
             self.root.quit()
             return
-        last = max(data.rfind(b"0"), data.rfind(b"1"))
-        if last < 0:
+        level = next((b - 48 for b in reversed(data) if 48 <= b <= 53), None)  # "0".."5"
+        if level is None:
             return
-        show = data[last:last + 1] == b"1"
-        if show and self.win is None:
-            self._show()
-        elif not show and self.win is not None:
+        if level == 0:
             self._hide()
+        elif self.win is None:
+            self._show(level)
+        else:
+            self._set_level(level)
 
-    def _show(self):
+    def _render(self, level):
+        """A foto da tela borrada no nível pedido (a foto é tirada uma vez só, ao aparecer)."""
+        import tkinter as tk
+
+        factor, brightness = BLUR_LEVELS[level]
+        base = self.bases.get(factor)
+        if base is None:
+            h, w = self.shot.shape[:2]
+            small = cv2.resize(self.shot, (max(1, w // factor), max(1, h // factor)),
+                               interpolation=cv2.INTER_AREA)
+            small = cv2.GaussianBlur(small, (0, 0), 1.2)
+            base = self.bases[factor] = cv2.resize(small, (w, h), interpolation=cv2.INTER_CUBIC)
+        rgb = cv2.cvtColor(cv2.convertScaleAbs(base, alpha=brightness), cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        return tk.PhotoImage(data=f"P6 {w} {h} 255 ".encode() + rgb.tobytes(), format="PPM")
+
+    def _show(self, level):
         import tkinter as tk
 
         with screen_grabber() as sct:
             whole = sct.monitors[0]
-            shot = np.asarray(sct.grab(whole))[:, :, :3]
-        h, w = shot.shape[:2]
-        small = cv2.resize(shot, (max(1, w // 24), max(1, h // 24)), interpolation=cv2.INTER_AREA)
-        small = cv2.GaussianBlur(small, (0, 0), 1.5)
-        blurred = cv2.resize(small, (w, h), interpolation=cv2.INTER_CUBIC)
-        blurred = cv2.convertScaleAbs(blurred, alpha=0.75)  # escurece um pouco
-        rgb = cv2.cvtColor(blurred, cv2.COLOR_BGR2RGB)
-        ppm = f"P6 {w} {h} 255 ".encode() + rgb.tobytes()
-        self.photo = tk.PhotoImage(data=ppm, format="PPM")
+            self.shot = np.ascontiguousarray(np.asarray(sct.grab(whole))[:, :, :3])
+        self.bases = {}
+        h, w = self.shot.shape[:2]
+        self.photo, self.level = self._render(level), level
 
         win = tk.Toplevel(self.root)
         win.overrideredirect(True)
         win.geometry(f"{w}x{h}+{whole['left']}+{whole['top']}")
         canvas = tk.Canvas(win, width=w, height=h, highlightthickness=0, bd=0, bg="black")
         canvas.pack()
-        canvas.create_image(0, 0, anchor="nw", image=self.photo)
+        self.image_item = canvas.create_image(0, 0, anchor="nw", image=self.photo)
         canvas.bind("<Button-1>", self._clicked)
         win.attributes("-topmost", True)
-        self.win = win
+        self.win, self.canvas = win, canvas
         self._fade(0.0)
         win.lift()
+
+    def _set_level(self, level):
+        if level == self.level:
+            return
+        self.photo, self.level = self._render(level), level
+        self.canvas.itemconfigure(self.image_item, image=self.photo)
 
     def _fade(self, alpha):
         if self.win is None:
@@ -1362,7 +1506,8 @@ class Overlay:
     def _hide(self):
         if self.win is not None:
             self.win.destroy()
-        self.win = self.photo = None
+        self.win = self.canvas = self.photo = self.shot = None
+        self.bases, self.level = {}, 0
 
     def _clicked(self, _event):
         if self.on_click():
@@ -1383,6 +1528,7 @@ def cmd_run(args):
         log.info("sem calibração: rode 'presence-guard calibrate' para ficar mais preciso")
     if not guard.gallery.enrolled:
         log.info("rosto não cadastrado: rode 'presence-guard cadastrar' para ele reconhecer você")
+    x_init_threads()
     root = tk.Tk()
     root.withdraw()
     overlay = Overlay(root, on_click=guard.snooze)

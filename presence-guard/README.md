@@ -2,8 +2,13 @@
 
 Usa a câmera infravermelha do ThinkPad (a mesma que o Howdy usa) para:
 
-- **borrar a tela** quando você não está olhando (padrão: 2,5 s), sem nenhum texto;
+- **borrar a tela** quando você não está olhando (padrão: 2,5 s), sem nenhum texto, em níveis:
+  - **virou o rosto** → borrão **leve** (dá para ver as janelas, não dá para ler);
+  - **outra pessoa olhando junto** → **médio** (com `outra_pessoa = borrar`);
+  - **saiu** → **forte**, que vai **escurecendo aos poucos** até bloquear (uma contagem sem números);
 - **bloquear o Ubuntu** se você sair e não voltar (padrão: 1 min borrado, depois bloqueia);
+- **entende o teclado e o mouse**: digitando olhando o teclado não borra, e mexer o mouse tira o
+  borrão leve;
 - **reconhecer você com e sem óculos**: se outra pessoa sentar no seu lugar, borra na hora
   (ela não consegue tirar o borrão) e bloqueia em 15 s;
 - avisar (ou borrar) quando **outra pessoa** está olhando a sua tela junto com você;
@@ -21,6 +26,12 @@ Feito para: Ubuntu 24.04, sessão **Ubuntu on Xorg** (X11), Howdy já funcionand
 3. **SFace** (OpenCV) compara o rosto com o seu cadastro (com e sem óculos).
 4. De óculos o infravermelho reflete nas lentes; quando ele vê o reflexo (ou reconhece você
    de óculos), passa a usar só a direção da cabeça.
+5. Virou tanto o rosto que ninguém mais acha o rosto (de perfil)? No infravermelho a sua cabeça
+   perto da câmera fica clara e o fundo escuro: se onde estava o rosto continua claro, ele sabe
+   que você só virou (borrão leve). Isso muda só o nível do borrão; o tempo para bloquear
+   continua contando, por segurança.
+6. Teclado/mouse (extensão XScreenSaver do X11): mexendo neles você conta como presente e
+   olhando — menos quando outra pessoa está no seu lugar.
 
 Para gastar pouco: analisa 1,5x por segundo quando está tudo normal e 4x por segundo só quando
 algo muda (desviou o olhar, saiu, tela borrada). Na bateria, metade disso. Entre uma análise e
@@ -126,11 +137,16 @@ Depois de mudar: `systemctl --user restart presence-guard`.
 | `ignorar_olhos_com_oculos` | sim | de óculos usa só a cabeça (o IR reflete nas lentes) |
 | `limite_dono` | 0.40 | semelhança mínima para ser você; abaixe se não te reconhecer |
 | `outra_pessoa` | avisar | `desligado`, `avisar` ou `borrar` |
+| `virou_o_rosto` | leve | nível do borrão ao virar o rosto: `leve`, `medio` ou `forte` |
+| `outra_pessoa_olhando` | medio | nível quando outra pessoa olha junto |
+| `escurecer_ate_bloquear` | sim | quando você sai, o borrão forte escurece aos poucos até bloquear |
+| `considerar_teclado_e_mouse` | sim | digitando/mexendo o mouse conta como olhando |
 | `pausar_borrao_em_videos` | sim | não borra com vídeo/chamada tocando (o bloqueio continua) |
 | `desbloqueio_ao_chegar` | nao | com a tela bloqueada, chama o Howdy quando você volta |
 | `analises_por_segundo` / `_alerta` | 1.5 / 4 | menos = gasta menos |
 
-Clique na tela borrada para ignorar por 20 s (não funciona quando é outra pessoa na frente).
+Clique na tela borrada para ignorar por 20 s, ou só mexa o mouse para tirar o borrão leve
+(nenhum dos dois funciona quando é outra pessoa no seu lugar).
 
 ## Energia
 
