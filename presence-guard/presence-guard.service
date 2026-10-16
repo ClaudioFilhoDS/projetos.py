@@ -1,0 +1,13 @@
+[Unit]
+Description=Presence Guard - bloqueia/borra a tela usando a camera IR
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/share/presence-guard/venv/bin/python %h/.local/share/presence-guard/presence_guard.py run
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target
