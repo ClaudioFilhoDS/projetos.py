@@ -31,6 +31,7 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import select
 import signal
@@ -44,6 +45,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+IS_WINDOWS = os.name == "nt"
+if IS_WINDOWS:
+    os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")  # abre a câmera mais rápido
+    try:  # pixels de verdade mesmo com a escala de 125%/150% do Windows
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        pass
 os.environ.setdefault("GLOG_minloglevel", "2")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
@@ -60,9 +68,20 @@ except AttributeError:
 APP = "presence-guard"
 SERVICE = f"{APP}.service"
 HOME = Path.home()
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / APP
-DATA_DIR = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") / APP
-RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/{APP}-{os.getuid()}") / APP
+if IS_WINDOWS:
+    CONFIG_DIR = Path(os.environ.get("APPDATA") or HOME / "AppData/Roaming") / APP
+    DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or HOME / "AppData/Local") / APP
+    RUNTIME_DIR = DATA_DIR / "run"
+else:
+    CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / APP
+    DATA_DIR = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") / APP
+    RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/{APP}-{os.getuid()}") / APP
+# Windows: arquivo de log, "desligado" (vale até o próximo `on`), PIDs e câmeras achadas
+LOG_FILE = DATA_DIR / "presence-guard.log"
+DISABLED_FILE = CONFIG_DIR / "desligado"
+PID_FILE = RUNTIME_DIR / "vigia.pid"
+SUPERVISOR_PID = RUNTIME_DIR / "supervisor.pid"
+CAMERAS_FILE = DATA_DIR / "cameras.json"
 CONFIG_FILE = CONFIG_DIR / "config.ini"
 CALIBRATION_FILE = CONFIG_DIR / "calibration.json"
 FACES_FILE = CONFIG_DIR / "rostos.npz"
@@ -201,7 +220,8 @@ class Config:
         self.lock = flag("recursos", "bloquear")
         self.blur = flag("recursos", "borrar")
         self.pause_blur_in_videos = flag("recursos", "pausar_borrao_em_videos")
-        self.wake_on_approach = flag("recursos", "desbloqueio_ao_chegar")
+        # no Windows o próprio Windows Hello já desbloqueia quando você chega
+        self.wake_on_approach = flag("recursos", "desbloqueio_ao_chegar") and not IS_WINDOWS
         self.notifications = flag("recursos", "notificacoes")
 
         def level(key, default):
@@ -299,12 +319,23 @@ def file_mtime(path):
         return 0.0
 
 
+def process_alive(pid):
+    return Path(f"/proc/{pid}").exists()
+
+
+def terminate(pid):
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
 def pid_file_alive(path):
     try:
         pid = int(path.read_text().strip())
     except (OSError, ValueError):
         return False
-    return Path(f"/proc/{pid}").exists()
+    return process_alive(pid)
 
 
 @contextmanager
@@ -375,6 +406,118 @@ def ensure_models(*names):
             raise RuntimeError(f"não consegui baixar {filename}")
 
 
+# --------------------------------------------------------------------------- Windows
+
+if IS_WINDOWS:
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _user32.OpenInputDesktop.restype = ctypes.c_void_p
+    _user32.OpenInputDesktop.argtypes = [ctypes.c_uint, ctypes.c_bool, ctypes.c_uint]
+    _user32.SwitchDesktop.argtypes = [ctypes.c_void_p]
+    _user32.CloseDesktop.argtypes = [ctypes.c_void_p]
+    _kernel32.OpenProcess.restype = ctypes.c_void_p
+    _kernel32.OpenProcess.argtypes = [ctypes.c_uint, ctypes.c_bool, ctypes.c_uint]
+    _kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    _kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    _kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    _kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint, ctypes.c_uint]
+    _kernel32.GetTickCount.restype = ctypes.c_uint
+
+    class _ProcessEntry(ctypes.Structure):
+        _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong),
+                    ("th32ProcessID", ctypes.c_ulong), ("th32DefaultHeapID", ctypes.c_void_p),
+                    ("th32ModuleID", ctypes.c_ulong), ("cntThreads", ctypes.c_ulong),
+                    ("th32ParentProcessID", ctypes.c_ulong), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", ctypes.c_ulong), ("szExeFile", ctypes.c_wchar * 260)]
+
+    class _PowerStatus(ctypes.Structure):
+        _fields_ = [("ACLineStatus", ctypes.c_ubyte), ("BatteryFlag", ctypes.c_ubyte),
+                    ("BatteryLifePercent", ctypes.c_ubyte), ("SystemStatusFlag", ctypes.c_ubyte),
+                    ("BatteryLifeTime", ctypes.c_ulong), ("BatteryFullLifeTime", ctypes.c_ulong)]
+
+    class _LastInput(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+    _kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ProcessEntry)]
+    _kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ProcessEntry)]
+
+    # janelas do Windows Hello dentro da sessão (UAC, senha de app, passkey)
+    HELLO_PROMPTS = {"credentialuibroker.exe", "consent.exe"}
+    TOAST = None  # o vigia aponta isto para os avisos do Tk dele
+
+    def screen_locked():  # noqa: F811
+        """Tela bloqueada, UAC ou Ctrl+Alt+Del (área de trabalho segura): é a hora em que
+        o Windows Hello precisa da câmera."""
+        desk = _user32.OpenInputDesktop(0, False, 0x0100)  # DESKTOP_SWITCHDESKTOP
+        if not desk:
+            return True
+        try:
+            return not _user32.SwitchDesktop(desk)
+        finally:
+            _user32.CloseDesktop(desk)
+
+    def lock_screen():  # noqa: F811
+        return bool(_user32.LockWorkStation())
+
+    def idle_inhibited():  # noqa: F811
+        """Algum app (vídeo, chamada) pediu para a tela ficar ligada."""
+        state = ctypes.c_ulong(0)
+        try:
+            res = ctypes.windll.powrprof.CallNtPowerInformation(
+                16, None, 0, ctypes.byref(state), ctypes.sizeof(state))  # SystemExecutionState
+        except (OSError, AttributeError):
+            return False
+        return res == 0 and bool(state.value & 0x2)  # ES_DISPLAY_REQUIRED
+
+    def notify(title, body=""):  # noqa: F811
+        if TOAST:
+            TOAST(title, body)
+
+    def on_battery():  # noqa: F811
+        status = _PowerStatus()
+        return bool(_kernel32.GetSystemPowerStatus(ctypes.byref(status))) and status.ACLineStatus == 0
+
+    def process_names():
+        snap = _kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+        if not snap or snap == ctypes.c_void_p(-1).value:
+            return
+        try:
+            entry = _ProcessEntry()
+            entry.dwSize = ctypes.sizeof(entry)
+            ok = _kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                yield entry.szExeFile.lower()
+                ok = _kernel32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            _kernel32.CloseHandle(snap)
+
+    def howdy_running():  # noqa: F811
+        """No Windows: uma janela do Windows Hello aberta dentro da sessão."""
+        return any(name in HELLO_PROMPTS for name in process_names())
+
+    def process_alive(pid):  # noqa: F811
+        handle = _kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong(0)
+            ok = _kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return bool(ok) and code.value == 259  # STILL_ACTIVE
+        finally:
+            _kernel32.CloseHandle(handle)
+
+    def terminate(pid):  # noqa: F811
+        handle = _kernel32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+        if handle:
+            _kernel32.TerminateProcess(handle, 0)
+            _kernel32.CloseHandle(handle)
+
+    def laptop_monitor():  # noqa: F811
+        """Monitor principal (no Windows ele sempre começa em 0,0)."""
+        return 0, 0, _user32.GetSystemMetrics(0), _user32.GetSystemMetrics(1)
+
+
 # --------------------------------------------------------------------------- câmera
 
 class CameraError(Exception):
@@ -418,7 +561,55 @@ def detect_ir_device():
     return None
 
 
+def windows_cameras(max_index=4):
+    """[(índice, é infravermelho?)] das câmeras que o Windows deixa abrir."""
+    found = []
+    for index in range(max_index):
+        cap = cv2.VideoCapture(index, cv2.CAP_MSMF)
+        try:
+            if not cap.isOpened():
+                continue
+            frame = None
+            for _ in range(5):
+                ok, f = cap.read()
+                if ok and f is not None:
+                    frame = f
+            if frame is None:
+                continue
+            gray = frame.ndim == 2 or (np.array_equal(frame[..., 0], frame[..., 1])
+                                       and np.array_equal(frame[..., 1], frame[..., 2]))
+            found.append([index, bool(gray)])
+        finally:
+            cap.release()
+    return found
+
+
+def resolve_device_windows(cfg, rescan=False):
+    want = cfg.device.strip().lower()
+    if want.isdigit():
+        return int(want), "config.ini"
+    cams = None
+    if not rescan:
+        try:
+            cams = json.loads(CAMERAS_FILE.read_text())
+        except (OSError, ValueError):
+            cams = None
+    if not cams:
+        cams = windows_cameras()
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        CAMERAS_FILE.write_text(json.dumps(cams))
+    ir = [i for i, gray in cams if gray]
+    rgb = [i for i, gray in cams if not gray]
+    if want != "rgb" and ir:
+        return ir[0], "infravermelho"
+    if rgb:
+        return rgb[0], "câmera normal" + ("" if want == "rgb" else " (o infravermelho não abriu)")
+    return 0, "padrão"
+
+
 def resolve_device(cfg):
+    if IS_WINDOWS:
+        return resolve_device_windows(cfg)
     if cfg.device.lower() != "auto":
         return cfg.device, "config.ini"
     dev = howdy_device()
@@ -444,7 +635,13 @@ class Camera:
     def open(self):
         RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
         CAMERA_FLAG.write_text(str(os.getpid()))  # antes de abrir: ninguém nos pega no meio
-        cap = cv2.VideoCapture(os.path.realpath(self.device), cv2.CAP_V4L2)
+        if IS_WINDOWS:
+            cap = cv2.VideoCapture(int(self.device), cv2.CAP_MSMF)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(int(self.device), cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(os.path.realpath(self.device), cv2.CAP_V4L2)
         if not cap.isOpened():
             cap.release()
             CAMERA_FLAG.unlink(missing_ok=True)
@@ -810,6 +1007,18 @@ class InputIdle:
         return self.info.contents.idle / 1000.0
 
 
+if IS_WINDOWS:
+    class InputIdle:  # noqa: F811
+        """No Windows a conta é direta: GetLastInputInfo."""
+        ok = True
+
+        def seconds(self):
+            info = _LastInput(ctypes.sizeof(_LastInput), 0)
+            if not _user32.GetLastInputInfo(ctypes.byref(info)):
+                return None
+            return ((_kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0
+
+
 def region_luma(frame, box):
     """Brilho médio da imagem dentro de `box` (x, y, w, h)."""
     x, y, w, h = (int(round(v)) for v in box)
@@ -825,11 +1034,14 @@ class Waker:
     IN_ATTRIB, IN_CLOSE_WRITE, IN_MOVED_TO, IN_CREATE, IN_DELETE = 0x4, 0x8, 0x80, 0x100, 0x200
 
     def __init__(self):
+        self.inotify = -1
+        if IS_WINDOWS:  # sem inotify nem select em pipes: um Event e confere 1x por segundo
+            self.event = threading.Event()
+            return
         self.read_fd, self.write_fd = os.pipe()
         for fd in (self.read_fd, self.write_fd):
             os.set_blocking(fd, False)
         self.names = {YIELD_FILE.name, HOLD_FILE.name}
-        self.inotify = -1
         try:
             libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
             fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
@@ -849,6 +1061,9 @@ class Waker:
 
     def wake(self):
         """Pode ser chamado de qualquer thread."""
+        if IS_WINDOWS:
+            self.event.set()
+            return
         try:
             os.write(self.write_fd, b"!")
         except BlockingIOError:
@@ -856,6 +1071,10 @@ class Waker:
 
     def wait(self, timeout):
         """Dorme até `timeout` segundos ou até algo importante acontecer."""
+        if IS_WINDOWS:
+            self.event.wait(max(0.0, min(timeout, 1.0)))
+            self.event.clear()
+            return
         if self.inotify < 0:
             timeout = min(timeout, 0.5)
         deadline = time.monotonic() + max(0.0, timeout)
@@ -906,6 +1125,10 @@ class LockWatcher:
             self.on_change()
 
     def _run(self):
+        if IS_WINDOWS:
+            while not self.stop.wait(0.5):
+                self._set(screen_locked())
+            return
         while not self.stop.is_set():
             try:
                 self.proc = subprocess.Popen(
@@ -1332,6 +1555,8 @@ class Guard:
                          absent_for)
                 if not lock_screen():
                     log.warning("não consegui bloquear a tela")
+                elif self.watcher:
+                    self.watcher.resync()  # já pausa e solta a câmera para o Hello/Howdy
             return
 
         if other_alert and cfg.other_person == "avisar" and now - self.other_notified >= 60:
@@ -1417,10 +1642,19 @@ class Overlay:
         self.on_click = on_click
         self.win = self.canvas = self.photo = self.shot = None
         self.bases, self.level, self.image_item = {}, 0, None
-        self.read_fd, self.write_fd = os.pipe()
-        for fd in (self.read_fd, self.write_fd):
-            os.set_blocking(fd, False)
-        root.tk.createfilehandler(self.read_fd, tk.READABLE, self._on_pipe)
+        self.toasts = queue.SimpleQueue()
+        # Linux: pipe + createfilehandler (o Tk só acorda quando chega pedido).
+        # Windows não tem createfilehandler: uma fila conferida 5x por segundo.
+        self.use_pipe = not IS_WINDOWS and hasattr(root.tk, "createfilehandler")
+        if self.use_pipe:
+            self.read_fd, self.write_fd = os.pipe()
+            for fd in (self.read_fd, self.write_fd):
+                os.set_blocking(fd, False)
+            root.tk.createfilehandler(self.read_fd, tk.READABLE, self._on_pipe)
+        else:
+            self.write_fd = None
+            self.inbox = queue.SimpleQueue()
+            root.after(200, self._poll)
 
     def request(self, level):
         """Chamado pela thread da câmera: 0 tira o borrão, 1..5 = nível (BLUR_LEVELS)."""
@@ -1431,10 +1665,32 @@ class Overlay:
         self._send(b"q")
 
     def _send(self, byte):
+        if not self.use_pipe:
+            self.inbox.put(byte)
+            return
         try:
             os.write(self.write_fd, byte)
         except BlockingIOError:
             pass
+
+    def toast(self, title, body=""):
+        """Aviso pequeno no canto da tela (usado no Windows)."""
+        self.toasts.put((title, body))
+        self._send(b"t")
+
+    def _poll(self):
+        data = b""
+        while True:
+            try:
+                data += self.inbox.get_nowait()
+            except queue.Empty:
+                break
+        if data:
+            try:
+                self._handle_bytes(data)
+            except Exception:
+                log.exception("erro ao mostrar/tirar o borrão")
+        self.root.after(200, self._poll)
 
     def _on_pipe(self, fd, mask):
         # o Tk não protege este callback: um erro aqui derrubaria o serviço inteiro
@@ -1448,7 +1704,16 @@ class Overlay:
             data = os.read(fd, 4096)
         except BlockingIOError:
             return
+        self._handle_bytes(data)
+
+    def _handle_bytes(self, data):
         # bytes de sinal também caem aqui; o Python trata o sinal logo depois deste callback
+        if b"t" in data:
+            while True:
+                try:
+                    self.show_toast(*self.toasts.get_nowait())
+                except queue.Empty:
+                    break
         if b"q" in data:
             self.root.quit()
             return
@@ -1526,6 +1791,24 @@ class Overlay:
         if self.on_click():
             self._hide()
 
+    def show_toast(self, title, body="", seconds=5):
+        import tkinter as tk
+
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        frame = tk.Frame(win, bg="#202124", padx=16, pady=12)
+        frame.pack()
+        tk.Label(frame, text=title, fg="white", bg="#202124",
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        if body:
+            tk.Label(frame, text=body, fg="#d0d0d0", bg="#202124", font=("Segoe UI", 9),
+                     wraplength=340, justify="left").pack(anchor="w")
+        win.update_idletasks()
+        x0, y0, w, h = laptop_monitor()
+        win.geometry(f"+{x0 + w - win.winfo_width() - 24}+{y0 + h - win.winfo_height() - 72}")
+        win.after(seconds * 1000, win.destroy)
+
 
 # --------------------------------------------------------------------------- comandos
 
@@ -1546,6 +1829,8 @@ def cmd_run(args):
     root.withdraw()
     overlay = Overlay(root, on_click=guard.snooze)
     guard.ui = overlay
+    if IS_WINDOWS:
+        globals()["TOAST"] = overlay.toast
     worker = threading.Thread(target=guard.run, name="camera", daemon=True)
 
     def shutdown(*_):
@@ -1554,8 +1839,9 @@ def cmd_run(args):
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
-    # o Tk dorme sem timers; um sinal escreve no pipe dele e o acorda para tratar
-    signal.set_wakeup_fd(overlay.write_fd, warn_on_full_buffer=False)
+    if overlay.use_pipe:
+        # o Tk dorme sem timers; um sinal escreve no pipe dele e o acorda para tratar
+        signal.set_wakeup_fd(overlay.write_fd, warn_on_full_buffer=False)
     worker.start()
     try:
         root.mainloop()
@@ -1564,6 +1850,19 @@ def cmd_run(args):
         worker.join(timeout=5)
     guard.engine.close()
     return 1 if guard.crashed else 0
+
+
+def cmd_run_windows(args):
+    """Só uma cópia por vez; o PID fica guardado para o `off` conseguir parar."""
+    if pid_file_alive(PID_FILE):
+        log.info("o vigia já está rodando")
+        return 0
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()))
+    try:
+        return cmd_run(args)
+    finally:
+        PID_FILE.unlink(missing_ok=True)
 
 
 CAL_TARGETS = (
@@ -1873,11 +2172,98 @@ def cmd_preview(args):
 
 
 def service_active():
+    if IS_WINDOWS:
+        return pid_file_alive(SUPERVISOR_PID) or pid_file_alive(PID_FILE)
     r = sh("systemctl", "--user", "is-active", SERVICE)
     return bool(r and r.stdout.strip() == "active")
 
 
+def cli_notify(title, body=""):
+    """Aviso para comandos (no Windows o atalho Ctrl+Alt+P não tem terminal para mostrar)."""
+    print(title + (f": {body}" if body else ""))
+    if not IS_WINDOWS:
+        notify(title, body)
+        return
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+        Overlay(root, on_click=lambda: True).show_toast(title, body, seconds=3)
+        root.after(3000, root.destroy)
+        root.mainloop()
+    except Exception:
+        pass
+
+
+SUPERVISED_ARGS = ["run"]
+
+
+def start_supervisor():
+    exe = Path(sys.executable)
+    pythonw = exe.with_name("pythonw.exe")
+    flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen([str(pythonw if pythonw.exists() else exe), str(Path(__file__).resolve()),
+                      "supervise"], creationflags=flags, close_fds=True, cwd=str(DATA_DIR))
+
+
+def stop_instances():
+    for path in (SUPERVISOR_PID, PID_FILE):  # o supervisor primeiro, senão ele reinicia o vigia
+        try:
+            pid = int(path.read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if process_alive(pid):
+            terminate(pid)
+        path.unlink(missing_ok=True)
+    CAMERA_FLAG.unlink(missing_ok=True)
+
+
+def cmd_supervise(args):
+    """Windows: mantém o vigia rodando e reinicia se ele cair, até você desligar."""
+    if DISABLED_FILE.exists() or pid_file_alive(SUPERVISOR_PID):
+        return 0
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    SUPERVISOR_PID.write_text(str(os.getpid()))
+    crashes = []
+    try:
+        while not DISABLED_FILE.exists():
+            child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), *SUPERVISED_ARGS],
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            code = child.wait()
+            if code == 0 or DISABLED_FILE.exists():
+                break
+            now = time.monotonic()
+            crashes = [t for t in crashes if now - t < 600] + [now]
+            if len(crashes) > 5:
+                log.error("o vigia caiu 5 vezes em 10 minutos; parei de reiniciar (veja o log)")
+                break
+            log.warning("o vigia parou com erro (código %s); reiniciando em 5 s", code)
+            time.sleep(5)
+    finally:
+        SUPERVISOR_PID.unlink(missing_ok=True)
+    return 0
+
+
+def cmd_cameras(args):
+    if not IS_WINDOWS:
+        print("No Linux: v4l2-ctl --list-devices  (o padrão é a mesma câmera do Howdy)")
+        return 0
+    print("Procurando câmeras (a luz da câmera pode piscar)...")
+    for index, gray in windows_cameras():
+        print(f"  câmera {index}: {'INFRAVERMELHO' if gray else 'normal (colorida)'}")
+    device, source = resolve_device_windows(Config(), rescan=True)
+    print(f"Vou usar a câmera {device} ({source}). Para forçar: dispositivo = <número> no config.ini")
+    return 0
+
+
 def cmd_on(args):
+    if IS_WINDOWS:
+        DISABLED_FILE.unlink(missing_ok=True)
+        if not service_active():
+            start_supervisor()
+        cli_notify("Presence Guard ligado", "Bloqueio e borrão automáticos ativos.")
+        return 0
     r = sh("systemctl", "--user", "enable", "--now", SERVICE, timeout=15)
     if not r or r.returncode != 0:
         print("não consegui ligar:", r.stderr.strip() if r else "systemctl indisponível")
@@ -1888,6 +2274,13 @@ def cmd_on(args):
 
 
 def cmd_off(args):
+    if IS_WINDOWS:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        DISABLED_FILE.touch()
+        stop_instances()
+        cli_notify("Presence Guard desligado", "Câmera livre e sem gasto de bateria. "
+                                               "Ctrl+Alt+P ou presence-guard on religa.")
+        return 0
     r = sh("systemctl", "--user", "disable", "--now", SERVICE, timeout=15)
     if not r or r.returncode != 0:
         print("não consegui desligar:", r.stderr.strip() if r else "systemctl indisponível")
@@ -1903,6 +2296,14 @@ def cmd_toggle(args):
 
 
 def cmd_log(args):
+    if IS_WINDOWS:
+        try:
+            lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            print("ainda não tem log em", LOG_FILE)
+            return 0
+        print("\n".join(lines[-80:]))
+        return 0
     os.execvp("journalctl", ["journalctl", "--user", "-u", SERVICE, "-n", "80",
                              "--no-pager", "-o", "short"])
 
@@ -1910,23 +2311,40 @@ def cmd_log(args):
 def cmd_debug(args):
     was_active = service_active()
     if was_active:
-        sh("systemctl", "--user", "stop", SERVICE, timeout=15)
+        if IS_WINDOWS:
+            stop_instances()
+        else:
+            sh("systemctl", "--user", "stop", SERVICE, timeout=15)
     logging.getLogger().setLevel(logging.DEBUG)
     print("Rodando com log detalhado. Ctrl+C para sair.", flush=True)
     try:
         return cmd_run(args)
     finally:
         if was_active:
-            sh("systemctl", "--user", "start", SERVICE, timeout=15)
+            if IS_WINDOWS:
+                if not DISABLED_FILE.exists():
+                    start_supervisor()
+            else:
+                sh("systemctl", "--user", "start", SERVICE, timeout=15)
 
 
 def cmd_status(args):
     cfg = Config()
-    enabled = sh("systemctl", "--user", "is-enabled", SERVICE)
-    print("ligado:        ", "sim" if service_active() else "não",
-          "(liga sozinho ao entrar)" if enabled and enabled.stdout.strip() == "enabled" else "")
-    print("câmera:        ", cfg.device if cfg.device.lower() != "auto"
-          else f"auto -> {howdy_device() or 'detectar ao iniciar'}")
+    if IS_WINDOWS:
+        print("ligado:        ", "sim" if service_active() else "não",
+              "(desligado até rodar: presence-guard on)" if DISABLED_FILE.exists() else "")
+        try:
+            cams = json.loads(CAMERAS_FILE.read_text())
+            names = ", ".join(f"{i} ({'IR' if g else 'normal'})" for i, g in cams)
+        except (OSError, ValueError):
+            names = "ainda não procurei (presence-guard cameras)"
+        print("câmera:        ", cfg.device, "->", names)
+    else:
+        enabled = sh("systemctl", "--user", "is-enabled", SERVICE)
+        print("ligado:        ", "sim" if service_active() else "não",
+              "(liga sozinho ao entrar)" if enabled and enabled.stdout.strip() == "enabled" else "")
+        print("câmera:        ", cfg.device if cfg.device.lower() != "auto"
+              else f"auto -> {howdy_device() or 'detectar ao iniciar'}")
     print("calibração:    ", json.loads(CALIBRATION_FILE.read_text()).get("created", "sim")
           if CALIBRATION_FILE.exists() else "não (rode: presence-guard calibrate)")
     gallery = Gallery()
@@ -1940,6 +2358,9 @@ def cmd_status(args):
         print("rosto:          não cadastrado (rode: presence-guard cadastrar)")
     missing = [n for n in MODELS if not model_path(n).exists()]
     print("modelos:       ", "ok" if not missing else "faltando " + ", ".join(missing))
+    if IS_WINDOWS:
+        print("log:           ", LOG_FILE)
+        return 0
     pam = [p for p in glob.glob("/etc/pam.d/*")
            if "presence-guard-yield" in Path(p).read_text(errors="ignore")]
     print("integração PAM:", ", ".join(pam) if pam else "não instalada")
@@ -1954,11 +2375,13 @@ def cmd_download_models(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        prog=APP, description="Bloqueia o Ubuntu quando você sai e borra a tela "
+        prog=APP, description="Bloqueia o computador quando você sai e borra a tela "
                               "quando você não está olhando.")
     parser.add_argument("--debug", action="store_true", help="mostra cada análise no log")
     sub = parser.add_subparsers(dest="command")
-    commands = (("run", cmd_run), ("on", cmd_on), ("off", cmd_off), ("toggle", cmd_toggle),
+    commands = (("run", cmd_run_windows if IS_WINDOWS else cmd_run), ("on", cmd_on),
+                ("off", cmd_off), ("toggle", cmd_toggle), ("supervise", cmd_supervise),
+                ("cameras", cmd_cameras),
                 ("calibrate", cmd_calibrate), ("preview", cmd_preview), ("status", cmd_status),
                 ("log", cmd_log), ("debug", cmd_debug), ("esquecer", cmd_forget),
                 ("download-models", cmd_download_models))
@@ -1970,9 +2393,17 @@ def main(argv=None):
                         help="soma ao cadastro atual em vez de começar do zero")
     enroll.set_defaults(func=cmd_enroll)
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-    func = getattr(args, "func", cmd_run)
+    level = logging.DEBUG if args.debug else logging.INFO
+    fmt = "%(asctime)s %(levelname)s %(message)s"
+    if IS_WINDOWS and args.command in (None, "run", "supervise"):
+        from logging.handlers import RotatingFileHandler
+
+        DATA_DIR.mkdir(parents=True, exist_ok=True)  # pythonw não tem terminal: vai para o arquivo
+        handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=1, encoding="utf-8")
+        logging.basicConfig(level=level, format=fmt, datefmt="%Y-%m-%d %H:%M:%S", handlers=[handler])
+    else:
+        logging.basicConfig(level=level, format=fmt, datefmt="%H:%M:%S")
+    func = getattr(args, "func", cmd_run_windows if IS_WINDOWS else cmd_run)
     return func(args)
 
 

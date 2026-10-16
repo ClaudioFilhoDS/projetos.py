@@ -185,6 +185,29 @@ Problemas comuns:
   bloqueio pode impedir o comando de bloqueio.
 - **O borrão não aparece**: confirme que a sessão é X11 (`echo $XDG_SESSION_TYPE`).
 
+## Windows 11
+
+O mesmo programa funciona no Windows 11 (testado na lógica; me mande o resultado no seu
+notebook). O que muda:
+
+- **Instalar**: descompacte o zip, entre na pasta `presence-guard` e dê dois cliques em
+  **`instalar.cmd`**. Ele instala o Python 3.12 se precisar (winget), o ambiente, os modelos,
+  inicia junto com o Windows e cria o atalho **Ctrl+Alt+P** para ligar/desligar.
+- **Windows Hello no lugar do Howdy**: quando a tela bloqueia, aparece o UAC (área de trabalho
+  segura) ou uma janela do Hello (senha de app, passkey), ele solta a câmera na hora para o
+  Hello te reconhecer. Para desbloquear sozinho quando você volta, ative em Configurações →
+  Contas → Opções de entrada → Reconhecimento facial: "dispensar automaticamente a tela de
+  bloqueio se o Windows reconhecer seu rosto".
+- **Câmera**: `presence-guard cameras` mostra quais câmeras abriram. Se o infravermelho não
+  abrir pelo OpenCV, ele usa a câmera normal (a luz fica acesa e no escuro funciona pior); nesse
+  caso, se for usar Teams/Meet, desligue com Ctrl+Alt+P durante a chamada ou ative "permitir
+  que vários apps usem a câmera" nas configurações da câmera do Windows.
+- **Se cair, reinicia sozinho** (supervisor); se cair 5 vezes em 10 minutos, para e registra no log.
+- Comandos iguais, num terminal novo: `presence-guard off | on | toggle | preview | cameras |
+  status | log | cadastrar | calibrate`. Log em `%LOCALAPPDATA%\presence-guard\presence-guard.log`.
+- Config em `%APPDATA%\presence-guard\config.ini` (depois de mudar: Ctrl+Alt+P duas vezes).
+- Desinstalar: dois cliques em `desinstalar.cmd`.
+
 ## Desinstalar
 
 ```bash
