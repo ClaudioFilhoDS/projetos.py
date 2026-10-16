@@ -26,13 +26,18 @@ step "Criando o ambiente Python (MediaPipe, OpenCV...)"
 mkdir -p "$APP_DIR" "$CONF_DIR" "$HOME/.local/bin"
 [ -x "$APP_DIR/venv/bin/python" ] || python3 -m venv "$APP_DIR/venv"
 "$APP_DIR/venv/bin/pip" install --quiet --upgrade pip
-"$APP_DIR/venv/bin/pip" install --quiet mediapipe mss pillow
+"$APP_DIR/venv/bin/pip" install --quiet mediapipe mss
 
 step "Copiando os arquivos"
 install -m 755 presence_guard.py "$APP_DIR/presence_guard.py"
-if [ -f "$CONF_DIR/config.ini" ]; then
+if [ -f "$CONF_DIR/config.ini" ] && grep -q '^\[energia\]' "$CONF_DIR/config.ini"; then
     echo "config.ini já existe; mantive o seu."
 else
+    # config da primeira versão: troca pela nova (borrão de 1 min, reconhecimento...)
+    if [ -f "$CONF_DIR/config.ini" ]; then
+        cp -a "$CONF_DIR/config.ini" "$CONF_DIR/config.ini.anterior"
+        echo "Config da versão anterior guardada em $CONF_DIR/config.ini.anterior"
+    fi
     install -m 644 config.ini "$CONF_DIR/config.ini"
 fi
 cat > "$BIN" <<EOF
@@ -40,7 +45,8 @@ cat > "$BIN" <<EOF
 exec "$APP_DIR/venv/bin/python" "$APP_DIR/presence_guard.py" "\$@"
 EOF
 chmod 755 "$BIN"
-"$BIN" download-model
+step "Baixando os modelos de rosto (~43 MB, só na primeira vez)"
+"$BIN" download-models
 
 step "Integração com o Howdy (para o sudo continuar reconhecendo seu rosto)"
 sudo install -m 755 presence-guard-yield /usr/local/bin/presence-guard-yield
@@ -90,9 +96,13 @@ Se der problema, volte neste terminal e desfaça com:
     for f in /etc/pam.d/*.bak-presence-guard; do sudo cp -a "\$f" "\${f%.bak-presence-guard}"; done
 
 EOF
-read -r -p "Calibrar o olhar agora? (leva 20 segundos) [S/n] " answer
+read -r -p "Calibrar o olhar agora? (leva 25 segundos) [S/n] " answer
 if [[ ! "$answer" =~ ^[nN] ]]; then
     "$BIN" calibrate || true
+fi
+read -r -p "Cadastrar seu rosto com e sem óculos agora? (leva 1 minuto) [S/n] " answer
+if [[ ! "$answer" =~ ^[nN] ]]; then
+    "$BIN" cadastrar || true
 fi
 cat <<'EOF'
 
@@ -102,6 +112,7 @@ ou use ~/.local/bin/presence-guard):
     presence-guard on         liga de novo
     presence-guard toggle     alterna (bom para um atalho de teclado)
     presence-guard calibrate  recalibra o olhar
+    presence-guard cadastrar  grava seu rosto com e sem óculos de novo
     presence-guard preview    mostra o que a câmera está vendo
     presence-guard log        o que ele andou fazendo (mande isso se der problema)
 EOF

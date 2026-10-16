@@ -1,8 +1,21 @@
 #!/bin/sh
-# Chamado pelo PAM (pam_exec) logo antes do Howdy: avisa o presence-guard para
-# soltar a câmera IR, senão o Howdy não consegue abrir a câmera.
+# Chamado pelo PAM (pam_exec) logo antes do Howdy: pede para o presence-guard
+# soltar a câmera IR e espera (no máximo 2 s) ele soltar, senão o Howdy não
+# consegue abrir a câmera.
 /usr/bin/touch /run/presence-guard.yield 2>/dev/null
-if /usr/bin/pgrep -f presence_guard.py >/dev/null 2>&1; then
-    /usr/bin/sleep 0.5
-fi
+
+camera_busy() {
+    for flag in /run/user/*/presence-guard/camera-open; do
+        [ -f "$flag" ] || continue
+        pid=$(/usr/bin/cat "$flag" 2>/dev/null)
+        [ -n "$pid" ] && [ -d "/proc/$pid" ] && return 0
+    done
+    return 1
+}
+
+i=0
+while camera_busy && [ "$i" -lt 40 ]; do
+    /usr/bin/sleep 0.05
+    i=$((i + 1))
+done
 exit 0

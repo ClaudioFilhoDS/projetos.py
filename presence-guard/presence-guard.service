@@ -8,6 +8,9 @@ ExecStart=%h/.local/share/presence-guard/venv/bin/python %h/.local/share/presenc
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+# vigia de fundo: cede a vez para os seus programas
+Nice=10
+IOSchedulingClass=idle
 
 [Install]
 WantedBy=graphical-session.target
