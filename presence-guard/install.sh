@@ -19,7 +19,7 @@ if [ "${XDG_SESSION_TYPE:-}" != "x11" ]; then
 fi
 
 step "Instalando pacotes do sistema"
-sudo apt-get update -qq
+sudo apt-get update -qq || warn "apt update falhou (algum repositório fora do ar?); seguindo com a lista que já existe"
 sudo apt-get install -y python3-venv python3-tk libnotify-bin xdotool x11-xserver-utils v4l-utils
 
 step "Criando o ambiente Python (MediaPipe, OpenCV...)"
@@ -50,7 +50,9 @@ step "Baixando os modelos de rosto (~43 MB, só na primeira vez)"
 
 step "Integração com o Howdy (para o sudo continuar reconhecendo seu rosto)"
 sudo install -m 755 presence-guard-yield /usr/local/bin/presence-guard-yield
-mapfile -t PAM_FILES < <(grep -lE '^[[:space:]]*auth[[:space:]].*howdy' /etc/pam.d/* 2>/dev/null || true)
+# (ignora os backups e arquivos do dpkg, senão uma reinstalação mexeria nos backups)
+mapfile -t PAM_FILES < <(grep -lE '^[[:space:]]*auth[[:space:]].*howdy' /etc/pam.d/* 2>/dev/null \
+    | grep -vE '\.(bak-presence-guard|dpkg-[a-z]+)$|~$' || true)
 if [ "${#PAM_FILES[@]}" -eq 0 ]; then
     warn "Não achei o Howdy em /etc/pam.d; pulei. (Veja a seção PAM no README.)"
 else
@@ -96,11 +98,11 @@ Se der problema, volte neste terminal e desfaça com:
     for f in /etc/pam.d/*.bak-presence-guard; do sudo cp -a "\$f" "\${f%.bak-presence-guard}"; done
 
 EOF
-read -r -p "Calibrar o olhar agora? (leva 25 segundos) [S/n] " answer
+read -r -p "Calibrar o olhar agora? (leva 25 segundos) [S/n] " answer || answer=n
 if [[ ! "$answer" =~ ^[nN] ]]; then
     "$BIN" calibrate || true
 fi
-read -r -p "Cadastrar seu rosto com e sem óculos agora? (leva 1 minuto) [S/n] " answer
+read -r -p "Cadastrar seu rosto com e sem óculos agora? (leva 1 minuto) [S/n] " answer || answer=n
 if [[ ! "$answer" =~ ^[nN] ]]; then
     "$BIN" cadastrar || true
 fi

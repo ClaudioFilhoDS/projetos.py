@@ -67,11 +67,12 @@ CONFIG_FILE = CONFIG_DIR / "config.ini"
 CALIBRATION_FILE = CONFIG_DIR / "calibration.json"
 FACES_FILE = CONFIG_DIR / "rostos.npz"
 HOLD_FILE = RUNTIME_DIR / "hold"
-# Existe enquanto alguém deste programa está com a câmera aberta; o
-# presence-guard-yield (PAM) espera ele sumir antes de deixar o Howdy rodar.
+# Existe enquanto alguém deste programa está com a câmera aberta (o cadastro, a
+# calibração e o preview esperam o serviço soltar a câmera olhando para ele).
 CAMERA_FLAG = RUNTIME_DIR / "camera-open"
-# Tocado pelo PAM (presence-guard-yield) logo antes do Howdy rodar.
-YIELD_FILE = Path("/run/presence-guard.yield")
+# O PAM (presence-guard-yield) encosta neste arquivo logo antes do Howdy rodar. Fica na
+# pasta do usuário porque no sudo o PAM roda o script como você, não como root.
+YIELD_FILE = RUNTIME_DIR / "yield"
 HOWDY_CONFIGS = (
     "/etc/howdy/config.ini",
     "/usr/local/etc/howdy/config.ini",
@@ -441,19 +442,21 @@ class Camera:
         return self.cap is not None
 
     def open(self):
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        CAMERA_FLAG.write_text(str(os.getpid()))  # antes de abrir: ninguém nos pega no meio
         cap = cv2.VideoCapture(os.path.realpath(self.device), cv2.CAP_V4L2)
         if not cap.isOpened():
             cap.release()
+            CAMERA_FLAG.unlink(missing_ok=True)
             raise CameraError(f"não consegui abrir a câmera {self.device} (em uso ou inexistente)")
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_FPS, 15)
         # os primeiros quadros saem escuros enquanto a exposição/emissor IR acordam
         if sum(cap.grab() for _ in range(5)) == 0:
             cap.release()
+            CAMERA_FLAG.unlink(missing_ok=True)
             raise CameraError(f"a câmera {self.device} não entregou imagem (em uso?)")
         self.cap = cap
-        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-        CAMERA_FLAG.write_text(str(os.getpid()))
 
     def fresh_frame(self, pick=2):
         """Um quadro de agora (não um que ficou parado no buffer), o mais claro de
@@ -962,6 +965,9 @@ class Guard:
         self.lock_requested = -1e9
         self.unlocked_at = -1e9
         self.learn_pending = False
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        if not YIELD_FILE.exists():
+            YIELD_FILE.write_bytes(b"")
         self.yield_seen = file_mtime(YIELD_FILE)
         self.yield_until = 0.0
         self.inhibit_checked = -1e9
@@ -1430,7 +1436,14 @@ class Overlay:
         except BlockingIOError:
             pass
 
-    def _on_pipe(self, fd, _mask):
+    def _on_pipe(self, fd, mask):
+        # o Tk não protege este callback: um erro aqui derrubaria o serviço inteiro
+        try:
+            self._handle_pipe(fd)
+        except Exception:
+            log.exception("erro ao mostrar/tirar o borrão")
+
+    def _handle_pipe(self, fd):
         try:
             data = os.read(fd, 4096)
         except BlockingIOError:
@@ -1544,9 +1557,11 @@ def cmd_run(args):
     # o Tk dorme sem timers; um sinal escreve no pipe dele e o acorda para tratar
     signal.set_wakeup_fd(overlay.write_fd, warn_on_full_buffer=False)
     worker.start()
-    root.mainloop()
-    guard.shutdown()
-    worker.join(timeout=5)
+    try:
+        root.mainloop()
+    finally:
+        guard.shutdown()
+        worker.join(timeout=5)
     guard.engine.close()
     return 1 if guard.crashed else 0
 

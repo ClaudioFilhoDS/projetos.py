@@ -1,24 +1,30 @@
 #!/bin/sh
-# Chamado pelo PAM (pam_exec) logo antes do Howdy: pede para o presence-guard
+# Chamado pelo PAM (pam_exec) logo antes do Howdy: avisa o presence-guard para
 # soltar a câmera IR e espera (no máximo 2 s) ele soltar, senão o Howdy não
 # consegue abrir a câmera. Nunca falha: o PAM segue normalmente de qualquer jeito.
-/usr/bin/touch /run/presence-guard.yield 2>/dev/null
+#
+# Roda como você (sudo, polkit, su) ou como root (tela de bloqueio do GNOME).
+# Não lê nenhum arquivo do usuário: só encosta no arquivo de aviso dele (sem
+# seguir atalhos e sem criar nada) e olha no /proc se o vigia ainda está com
+# uma câmera (/dev/video*) aberta.
+
+for f in /run/user/*/presence-guard/yield; do
+    [ -f "$f" ] && [ ! -L "$f" ] && /usr/bin/touch -c -h "$f" 2>/dev/null
+done
 
 camera_busy() {
-    for flag in /run/user/*/presence-guard/camera-open; do
-        [ -f "$flag" ] || continue
-        # o arquivo é do usuário: lê só o começo e só aceita um número (PID)
-        pid=$(/usr/bin/head -c 12 "$flag" 2>/dev/null)
-        case "$pid" in
-            ''|*[!0-9]*) continue ;;
-        esac
-        [ -d "/proc/$pid" ] && return 0
+    for pid in $(/usr/bin/pgrep -f presence_guard.py 2>/dev/null); do
+        for fd in /proc/"$pid"/fd/*; do
+            case "$(/usr/bin/readlink "$fd" 2>/dev/null)" in
+                /dev/video*) return 0 ;;
+            esac
+        done
     done
     return 1
 }
 
 i=0
-while camera_busy && [ "$i" -lt 40 ]; do
+while camera_busy && [ "$i" -lt 25 ]; do
     /usr/bin/sleep 0.05
     i=$((i + 1))
 done
