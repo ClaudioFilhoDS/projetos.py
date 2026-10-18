@@ -22,6 +22,7 @@ Comandos:
 """
 
 import argparse
+import concurrent.futures
 import configparser
 import ctypes
 import ctypes.util
@@ -588,6 +589,15 @@ def resolve_device_windows(cfg, rescan=False):
     want = cfg.device.strip().lower()
     if want.isdigit():
         return int(want), "config.ini"
+    if want in ("auto", "ir"):
+        try:
+            names = run_in_mta(windows_ir_sources)
+        except Exception as e:
+            names = []
+            log.info("API de câmera do Windows indisponível (%s)", e)
+        if names:
+            return WINRT_IR, f"infravermelho: {names[0]}"
+        log.warning("o Windows não mostra a câmera infravermelha para os apps; usando a normal")
     cams = None
     if not rescan:
         try:
@@ -601,7 +611,7 @@ def resolve_device_windows(cfg, rescan=False):
     ir = [i for i, gray in cams if gray]
     rgb = [i for i, gray in cams if not gray]
     if want != "rgb" and ir:
-        return ir[0], "infravermelho"
+        return ir[0], "infravermelho (OpenCV)"
     if rgb:
         return rgb[0], "câmera normal" + ("" if want == "rgb" else " (o infravermelho não abriu)")
     return 0, "padrão"
@@ -683,6 +693,226 @@ class Camera:
             self.cap.release()
             self.cap = None
             CAMERA_FLAG.unlink(missing_ok=True)
+
+
+WINRT_IR = "winrt-ir"  # "dispositivo" que quer dizer: a câmera IR do Windows Hello, via WinRT
+
+
+def winrt_init():
+    """A API de câmera do Windows (WinRT) quer a thread num apartamento COM multithread."""
+    try:
+        from winrt.runtime import ApartmentType, init_apartment
+
+        init_apartment(ApartmentType.MULTI_THREADED)
+    except Exception:  # já iniciado nesta thread, ou pywinrt antigo: segue assim mesmo
+        pass
+
+
+def run_in_mta(func, *args):
+    """Roda `func` numa thread própria (MTA), sem mexer no apartamento da thread do Tk."""
+    with concurrent.futures.ThreadPoolExecutor(1, initializer=winrt_init) as pool:
+        return pool.submit(func, *args).result()
+
+
+def windows_ir_sources():
+    """Nomes das câmeras infravermelhas que o Windows mostra para os apps."""
+    from winrt.windows.media.capture.frames import MediaFrameSourceGroup, MediaFrameSourceKind
+
+    names = []
+    for group in MediaFrameSourceGroup.find_all_async().get():
+        if any(info.source_kind == MediaFrameSourceKind.INFRARED for info in group.source_infos):
+            names.append(group.display_name)
+    return names
+
+
+def bitmap_to_gray(bitmap):
+    """SoftwareBitmap (Gray8, Gray16, NV12 ou outro) -> imagem cinza 8 bits do numpy."""
+    from winrt.windows.graphics.imaging import (BitmapBufferAccessMode, BitmapPixelFormat,
+                                                 SoftwareBitmap)
+
+    if bitmap is None:
+        return None
+    fmt = bitmap.bitmap_pixel_format
+    if fmt not in (BitmapPixelFormat.GRAY8, BitmapPixelFormat.GRAY16, BitmapPixelFormat.NV12):
+        bitmap = SoftwareBitmap.convert(bitmap, BitmapPixelFormat.GRAY8)
+        fmt = BitmapPixelFormat.GRAY8
+    with bitmap.lock_buffer(BitmapBufferAccessMode.READ) as buffer:
+        plane = buffer.get_plane_description(0)  # Gray8/Gray16: a imagem; NV12: o Y (cinza)
+        with buffer.create_reference() as ref:
+            raw = np.frombuffer(memoryview(ref), dtype=np.uint8)
+            rows = raw[plane.start_index:plane.start_index + plane.stride * plane.height]
+            rows = rows.reshape(plane.height, plane.stride).copy()
+    if fmt == BitmapPixelFormat.GRAY16:
+        img = rows.view(np.uint16)[:, :plane.width]
+        shift = max(0, int(img.max()).bit_length() - 8)  # sensores IR costumam usar 10-12 bits
+        return (img >> shift).astype(np.uint8)
+    return rows[:, :plane.width]
+
+
+class WindowsIRCamera:
+    """A câmera infravermelha do Windows Hello, lida pela API de câmera do próprio Windows
+    (o OpenCV não enxerga ela). Tenta o controle exclusivo, que deixa acender o emissor IR;
+    se o Windows não deixar, lê compartilhando com quem já está usando. Todas as chamadas
+    WinRT rodam numa thread própria (MTA), venha a chamada de onde vier."""
+
+    def __init__(self, device=WINRT_IR):
+        self.device = device
+        self.pool = None
+        self.capture = self.reader = None
+        self.exclusive = False
+        self.torch = "?"
+        self.last_time = None
+
+    @property
+    def is_open(self):
+        return self.reader is not None
+
+    def _call(self, func, *args):
+        if self.pool is None:
+            self.pool = concurrent.futures.ThreadPoolExecutor(
+                1, thread_name_prefix="winrt", initializer=winrt_init)
+        return self.pool.submit(func, *args).result()
+
+    def open(self):
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        CAMERA_FLAG.write_text(str(os.getpid()))
+        try:
+            self._call(self._open)
+        except Exception as e:
+            self.close()
+            raise CameraError(f"a câmera infravermelha do Windows não abriu: {e}") from e
+
+    def _open(self):
+        from winrt.windows.media.capture import (MediaCapture, MediaCaptureInitializationSettings,
+                                                  MediaCaptureMemoryPreference,
+                                                  MediaCaptureSharingMode, StreamingCaptureMode)
+        from winrt.windows.media.capture.frames import (MediaFrameReaderAcquisitionMode,
+                                                         MediaFrameReaderStartStatus,
+                                                         MediaFrameSourceGroup,
+                                                         MediaFrameSourceKind)
+
+        group = info = None
+        for g in MediaFrameSourceGroup.find_all_async().get():
+            info = next((i for i in g.source_infos
+                         if i.source_kind == MediaFrameSourceKind.INFRARED), None)
+            if info is not None:
+                group = g
+                break
+        if group is None:
+            raise CameraError("o Windows não mostra nenhuma câmera infravermelha para os apps")
+        errors = []
+        for mode in (MediaCaptureSharingMode.EXCLUSIVE_CONTROL,
+                     MediaCaptureSharingMode.SHARED_READ_ONLY):
+            settings = MediaCaptureInitializationSettings()
+            settings.source_group = group
+            settings.sharing_mode = mode
+            settings.memory_preference = MediaCaptureMemoryPreference.CPU
+            settings.streaming_capture_mode = StreamingCaptureMode.VIDEO
+            capture = MediaCapture()
+            try:
+                capture.initialize_with_settings_async(settings).get()
+            except Exception as e:
+                errors.append(f"{mode.name}: {e}")
+                capture.close()
+                continue
+            self.capture = capture
+            self.exclusive = mode == MediaCaptureSharingMode.EXCLUSIVE_CONTROL
+            break
+        if self.capture is None:
+            raise CameraError("; ".join(errors))
+        if self.exclusive:
+            self._torch_on()
+        reader = self.capture.create_frame_reader_async(self.capture.frame_sources[info.id]).get()
+        reader.acquisition_mode = MediaFrameReaderAcquisitionMode.REALTIME
+        status = reader.start_async().get()
+        if status != MediaFrameReaderStartStatus.SUCCESS:
+            reader.close()
+            raise CameraError(f"a leitura não começou ({status.name})")
+        self.reader = reader
+        if self._fresh_frame(3.0) is None:
+            raise CameraError("a câmera infravermelha não mandou imagem")
+
+    def _torch_on(self):
+        """Acende o emissor IR (alternado = metade do gasto; os quadros apagados são pulados)."""
+        from winrt.windows.media.devices import InfraredTorchMode
+
+        try:
+            torch = self.capture.video_device_controller.infrared_torch_control
+            if not torch.is_supported:
+                self.torch = "o driver não deixa controlar (fica por conta dele)"
+                return
+            modes = list(torch.supported_modes)
+            mode = (InfraredTorchMode.ALTERNATING_FRAME_ILLUMINATION
+                    if InfraredTorchMode.ALTERNATING_FRAME_ILLUMINATION in modes
+                    else InfraredTorchMode.ON)
+            torch.current_mode = mode
+            self.torch = "alternado" if mode == InfraredTorchMode.ALTERNATING_FRAME_ILLUMINATION else "ligado"
+        except Exception as e:
+            self.torch = f"sem controle ({e})"
+
+    def fresh_frame(self, pick=2):
+        if self.reader is None:
+            return None
+        try:
+            return self._call(self._fresh_frame, 0.8)
+        except Exception as e:
+            log.warning("erro lendo a câmera infravermelha: %s", e)
+            return None
+
+    def _fresh_frame(self, timeout):
+        """O próximo quadro novo iluminado pelo emissor IR."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ref = self.reader.try_acquire_latest_frame()
+            if ref is None:
+                time.sleep(0.02)
+                continue
+            gray = None
+            try:
+                stamp = ref.system_relative_time
+                if stamp is not None and stamp == self.last_time:
+                    time.sleep(0.02)
+                    continue
+                self.last_time = stamp
+                video = ref.video_media_frame
+                try:
+                    infrared = video.infrared_media_frame if video is not None else None
+                except Exception:
+                    infrared = None
+                if infrared is not None and not infrared.is_illuminated:
+                    continue  # quadro com o emissor apagado: escuro, pula
+                gray = bitmap_to_gray(video.software_bitmap) if video is not None else None
+            finally:
+                ref.close()
+            if gray is not None:
+                return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        return None
+
+    def close(self):
+        if self.pool is not None:
+            try:
+                self._call(self._close)
+            except Exception:
+                pass
+            self.pool.shutdown(wait=False)
+            self.pool = None
+        CAMERA_FLAG.unlink(missing_ok=True)
+
+    def _close(self):
+        reader, capture = self.reader, self.capture
+        self.reader = self.capture = None
+        if reader is not None:
+            try:
+                reader.stop_async().get()
+            except Exception:
+                pass
+            reader.close()
+        if capture is not None:
+            capture.close()  # solta a câmera para o Windows Hello
+
+
+def make_camera(device):
+    return WindowsIRCamera(device) if device == WINRT_IR else Camera(device)
 
 
 def is_dark(frame):
@@ -1163,7 +1393,7 @@ class Guard:
     def __init__(self, cfg, device):
         self.cfg = cfg
         self.ui = None
-        self.cam = Camera(device)
+        self.cam = make_camera(device)
         self.gallery = Gallery()
         self.engine = FaceEngine(recognizer=self.wants_recognition())
         self.tracker = Tracker()
@@ -1817,7 +2047,7 @@ def cmd_run(args):
 
     cfg = Config()
     ensure_models("detector", "landmarker")
-    device, source = resolve_device(cfg)
+    device, source = windows_pick_camera(cfg) if IS_WINDOWS else resolve_device(cfg)
     log.info("câmera: %s (%s)", device, source)
     guard = Guard(cfg, device)
     if not guard.attention.calibrated:
@@ -1865,6 +2095,25 @@ def cmd_run_windows(args):
         PID_FILE.unlink(missing_ok=True)
 
 
+def windows_pick_camera(cfg):
+    """Infravermelho do Windows Hello se abrir de verdade; senão a câmera normal."""
+    device, source = resolve_device_windows(cfg)
+    if device != WINRT_IR:
+        return device, source
+    probe = WindowsIRCamera()
+    try:
+        probe.open()
+    except CameraError as e:
+        log.warning("%s", e)
+        cfg_rgb = Config()
+        cfg_rgb.device = "rgb"
+        device, other = resolve_device_windows(cfg_rgb)
+        return device, other + " (a infravermelha não abriu)"
+    finally:
+        probe.close()
+    return device, f"{source}, {'controle exclusivo' if probe.exclusive else 'compartilhada'}, emissor {probe.torch}"
+
+
 CAL_TARGETS = (
     ("centro", 0.5, 0.5),
     ("canto superior esquerdo", 0.03, 0.04),
@@ -1909,7 +2158,7 @@ def cmd_calibrate(args):
     with camera_hold():
         device, source = resolve_device(cfg)
         print(f"Câmera: {device} ({source})")
-        cam = Camera(device)
+        cam = make_camera(device)
         cam.open()
         engine = FaceEngine()
         x, y, w, h = laptop_monitor()
@@ -2050,7 +2299,7 @@ def cmd_enroll(args):
         device, source = resolve_device(cfg)
         print(f"Câmera: {device} ({source})")
         engine = FaceEngine(landmarker=False, recognizer=True)
-        cam = Camera(device)
+        cam = make_camera(device)
         cam.open()
         try:
             for label, name in LABELS.items():
@@ -2115,7 +2364,7 @@ def cmd_preview(args):
         recog = cfg.recognition and gallery.enrolled
         engine = FaceEngine(recognizer=recog)
         attention = Attention(cfg)
-        cam = Camera(device)
+        cam = make_camera(device)
         cam.open()
         title = "Presence Guard - preview (q para sair)"
         try:
@@ -2249,11 +2498,34 @@ def cmd_cameras(args):
     if not IS_WINDOWS:
         print("No Linux: v4l2-ctl --list-devices  (o padrão é a mesma câmera do Howdy)")
         return 0
-    print("Procurando câmeras (a luz da câmera pode piscar)...")
+    print("Câmeras infravermelhas que o Windows mostra para os apps (API do Windows):")
+    try:
+        names = run_in_mta(windows_ir_sources)
+    except Exception as e:
+        names = []
+        print("  erro na API de câmera do Windows:", e)
+    for name in names:
+        print("  -", name)
+    if names:
+        probe = WindowsIRCamera()
+        try:
+            probe.open()
+            frame = probe.fresh_frame()
+            light = f"brilho {frame.mean():.0f}" if frame is not None else "sem imagem"
+            print(f"  abriu: {'controle exclusivo' if probe.exclusive else 'compartilhada'}, "
+                  f"emissor IR {probe.torch}, {light}")
+        except CameraError as e:
+            print("  NÃO abriu:", e)
+        finally:
+            probe.close()
+    else:
+        print("  nenhuma. Se a 'Segurança de Entrada Aprimorada' do Windows Hello estiver ligada,")
+        print("  o Windows não empresta a câmera infravermelha para nenhum outro app.")
+    print("Câmeras pelo OpenCV (a luz da câmera pode piscar):")
     for index, gray in windows_cameras():
-        print(f"  câmera {index}: {'INFRAVERMELHO' if gray else 'normal (colorida)'}")
-    device, source = resolve_device_windows(Config(), rescan=True)
-    print(f"Vou usar a câmera {device} ({source}). Para forçar: dispositivo = <número> no config.ini")
+        print(f"  câmera {index}: {'infravermelho' if gray else 'normal (colorida)'}")
+    device, source = windows_pick_camera(Config())
+    print(f"Vou usar: {device} ({source}). Para forçar: dispositivo = ir | rgb | <número> no config.ini")
     return 0
 
 

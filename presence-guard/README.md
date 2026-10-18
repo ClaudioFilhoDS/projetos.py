@@ -198,10 +198,16 @@ notebook). O que muda:
   Hello te reconhecer. Para desbloquear sozinho quando você volta, ative em Configurações →
   Contas → Opções de entrada → Reconhecimento facial: "dispensar automaticamente a tela de
   bloqueio se o Windows reconhecer seu rosto".
-- **Câmera**: `presence-guard cameras` mostra quais câmeras abriram. Se o infravermelho não
-  abrir pelo OpenCV, ele usa a câmera normal (a luz fica acesa e no escuro funciona pior); nesse
-  caso, se for usar Teams/Meet, desligue com Ctrl+Alt+P durante a chamada ou ative "permitir
-  que vários apps usem a câmera" nas configurações da câmera do Windows.
+- **Câmera infravermelha**: no Windows ela é lida pela API de câmera do próprio Windows (o OpenCV
+  só enxerga a câmera normal). Ele tenta o controle exclusivo para acender o emissor IR (modo
+  alternado, metade do gasto) e, se o Windows não deixar, lê compartilhando com o Hello.
+  `presence-guard cameras` mostra se a IR abriu, se o emissor acendeu e o brilho da imagem.
+- **Se a IR não aparecer**: com a "Segurança de Entrada Aprimorada" (Enhanced Sign-in Security)
+  ligada, o Windows reserva a câmera infravermelha só para o Hello e não empresta para nenhum app.
+  Ela é desligada em Configurações → Contas → Opções de entrada → ligando "Entrar com uma câmera
+  externa ou leitor de impressão digital" (o Windows pede para cadastrar o rosto no Hello de novo,
+  e o Hello fica um pouco menos protegido). Sem a IR ele usa a câmera normal: a luz fica acesa,
+  no escuro não funciona e em chamadas de vídeo desligue com Ctrl+Alt+P.
 - **Se cair, reinicia sozinho** (supervisor); se cair 5 vezes em 10 minutos, para e registra no log.
 - Comandos iguais, num terminal novo: `presence-guard off | on | toggle | preview | cameras |
   status | log | cadastrar | calibrate`. Log em `%LOCALAPPDATA%\presence-guard\presence-guard.log`.

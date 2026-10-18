@@ -44,6 +44,12 @@ New-Item -ItemType Directory -Force -Path $Data, $Conf, $Bin | Out-Null
 if (-not (Test-Path $Py)) { & $Base -m venv $Venv }
 & $Py -m pip install --quiet --upgrade pip
 & $Py -m pip install --quiet mediapipe mss
+# API de câmera do Windows (WinRT): é por ela que dá para ler a câmera infravermelha
+& $Py -m pip install --quiet winrt-runtime winrt-Windows.Foundation winrt-Windows.Foundation.Collections `
+    winrt-Windows.Media winrt-Windows.Media.Capture winrt-Windows.Media.Capture.Frames `
+    winrt-Windows.Media.Devices winrt-Windows.Media.Devices.Core winrt-Windows.Media.MediaProperties `
+    winrt-Windows.Graphics.Imaging winrt-Windows.Graphics.DirectX.Direct3D11 winrt-Windows.Storage.Streams `
+    winrt-Windows.Devices.Enumeration winrt-Windows.Perception.Spatial
 if ($LASTEXITCODE -ne 0) { throw "A instalação dos pacotes Python falhou (veja a mensagem acima)." }
 
 Step "Copiando os arquivos"
